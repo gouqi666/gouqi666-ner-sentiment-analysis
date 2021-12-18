@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch
 import os
 from utils import load_vectors,ner_accuary
-from preprocess import data_process,read_data_from_csv,ner_dataset,bert_ner_dataset
+from preprocess import data_process,read_data_from_csv,bert_ner_dataset
 from model import BERT_CRF
 tokenizer = AutoTokenizer.from_pretrained("nghuyong/ernie-1.0")
 def bert_collate_fn(batch,token_id=tokenizer.pad_token_id,token_type_id=tokenizer.pad_token_type_id):
@@ -21,18 +21,25 @@ def bert_collate_fn(batch,token_id=tokenizer.pad_token_id,token_type_id=tokenize
     labels =  [[-1] + seq + [-1]*(max_len-len(seq)-1) for seq in labels]  #cls 和sep
     return torch.tensor(inputs_ids,dtype = torch.long),torch.tensor(token_type_ids,dtype = torch.long),torch.tensor(attention_mask,dtype = torch.long),torch.tensor(labels,dtype=torch.long),torch.tensor(text_lengths,dtype=torch.long)
 
-
-
+def seed_torch(seed=42):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
 
 if __name__ == "__main__":
-
+    seed_torch()
     train_data, test_data = read_data_from_csv()
     tokenizer = AutoTokenizer.from_pretrained("nghuyong/ernie-1.0")
     tag_to_ix = {'B-BANK': 0, 'I-BANK': 1, 'O': 2, 'B-COMMENTS_N': 3, 'I-COMMENTS_N': 4, 'B-COMMENTS_ADJ': 5,
                  'I-COMMENTS_ADJ': 6, 'B-PRODUCT': 7, 'I-PRODUCT': 8, '<START>': 9, '<STOP>': 10}
     ## datasets
     train_datasets = bert_ner_dataset(train_data['text'], train_data['BIO_anno'], tag_to_ix)
-    # train_datasets, valid_datasets = torch.utils.data.random_split(train_datasets, [7000, 528],
+    # train_datasets, valid_datasets = torch.utils.data.random_split(train_datasets, [5522, 500],
     #                                                                generator=torch.Generator().manual_seed(42))
     train_data_loader = DataLoader(
         train_datasets,
@@ -59,7 +66,7 @@ if __name__ == "__main__":
     ckpt_dir = './'
 
     # train
-    epoches = 20
+    epoches = 30
     global_step = 0
     valid_F1 = float('inf')
     min_loss = float('inf')
@@ -94,7 +101,7 @@ if __name__ == "__main__":
             os.makedirs(save_dir)
         if mean_loss < min_loss:
             min_loss = mean_loss
-            torch.save(model.state_dict(), os.path.join(save_dir, 'ner_bert_crf2_best_model.pt'))
+            torch.save(model.state_dict(), os.path.join(save_dir, 'ner_bert_crf_best_model.pt'))
         # with torch.no_grad():
         #     torch.cuda.empty_cache()
         #     total_F1 = []

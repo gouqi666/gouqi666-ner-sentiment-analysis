@@ -32,17 +32,132 @@ def seed_torch(seed=42):
     torch.backends.cudnn.enabled = False
 
 
+class FocalLoss_Ori(nn.Module):
+    """
+    This is a implementation of Focal Loss with smooth label cross entropy supported which is proposed in
+    'Focal Loss for Dense Object Detection. (https://arxiv.org/abs/1708.02002)'
+    Focal_Loss= -1*alpha*((1-pt)**gamma)*log(pt)
+    Args:
+        num_class: number of classes
+        alpha: class balance factor
+        gamma:
+        ignore_index:
+        reduction:
+    """
 
+    def __init__(self, num_class, alpha=None, gamma=2, ignore_index=None, reduction='mean'):
+        super(FocalLoss_Ori, self).__init__()
+        self.num_class = num_class
+        self.gamma = gamma
+        self.reduction = reduction
+        self.smooth = 1e-4
+        self.ignore_index = ignore_index
+        self.alpha = alpha
+        if alpha is None:
+            self.alpha = torch.ones(num_class, )
+        elif isinstance(alpha, (int, float)):
+            self.alpha = torch.as_tensor([alpha] * num_class)
+        elif isinstance(alpha, (list, np.ndarray)):
+            self.alpha = torch.as_tensor(alpha)
+        if self.alpha.shape[0] != num_class:
+            raise RuntimeError('the length not equal to number of class')
+
+        # if isinstance(self.alpha, (list, tuple, np.ndarray)):
+        #     assert len(self.alpha) == self.num_class
+        #     self.alpha = torch.Tensor(list(self.alpha))
+        # elif isinstance(self.alpha, (float, int)):
+        #     assert 0 < self.alpha < 1.0, 'alpha should be in `(0,1)`)'
+        #     assert balance_index > -1
+        #     alpha = torch.ones((self.num_class))
+        #     alpha *= 1 - self.alpha
+        #     alpha[balance_index] = self.alpha
+        #     self.alpha = alpha
+        # elif isinstance(self.alpha, torch.Tensor):
+        #     self.alpha = self.alpha
+        # else:
+        #     raise TypeError('Not support alpha type, expect `int|float|list|tuple|torch.Tensor`')
+
+    def forward(self, logit, target):
+        # assert isinstance(self.alpha,torch.Tensor)\
+        N, C = logit.shape[:2]
+        alpha = self.alpha.to(logit.device)
+        prob = F.softmax(logit, dim=1)
+        if prob.dim() > 2:
+            # N,C,d1,d2 -> N,C,m (m=d1*d2*...)
+            prob = prob.view(N, C, -1)
+            prob = prob.transpose(1, 2).contiguous()  # [N,C,d1*d2..] -> [N,d1*d2..,C]
+            prob = prob.view(-1, prob.size(-1))  # [N,d1*d2..,C]-> [N*d1*d2..,C]
+        ori_shp = target.shape
+        target = target.view(-1, 1)  # [N,d1,d2,...]->[N*d1*d2*...,1]
+        valid_mask = None
+        if self.ignore_index is not None:
+            valid_mask = target != self.ignore_index
+            target = target * valid_mask
+
+        # ----------memory saving way--------
+        prob = prob.gather(1, target).view(-1) + self.smooth  # avoid nan
+        logpt = torch.log(prob)
+        # alpha_class = alpha.gather(0, target.view(-1))
+        alpha_class = alpha[target.squeeze().long()]
+        class_weight = -alpha_class * torch.pow(torch.sub(1.0, prob), self.gamma)
+        loss = class_weight * logpt
+        if valid_mask is not None:
+            loss = loss * valid_mask.squeeze()
+
+        if self.reduction == 'mean':
+            loss = loss.mean()
+            if valid_mask is not None:
+                loss = loss.sum() / valid_mask.sum()
+        elif self.reduction == 'none':
+            loss = loss.view(ori_shp)
+        return loss
 if __name__ == '__main__':
     seed_torch()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(device)
     ##########    dataset
     # print(len(train_data)) # train_data 总共7528条数据
     train_data,test_data = read_data_from_csv()
-    train_dataset = sentiment_dataset(train_data['text'],train_data['class'])
+    train_text = list(train_data['text'])
+    train_label = list(train_data['class'])
+    ## 1. 增加低比例样本，随机采样
+    # neg_index = []
+    # pos_index = []
+    # for i in range(len(train_label)):
+    #     if train_label[i] == 0:
+    #         neg_index.append(i)
+    #     elif train_label[i] == 1:
+    #         pos_index.append(i)
+    # for i in range(50):
+    #     pos_rand = pos_index[np.random.randint(len(pos_index))]
+    #     train_text.append(train_data.iloc[pos_rand]['text'])
+    #     train_label.append(train_data.iloc[pos_rand]['class'])
+    #
+    #     pos_rand = pos_index[np.random.randint(len(pos_index))]
+    #     train_text.append(train_data.iloc[pos_rand]['text'])
+    #     train_label.append(train_data.iloc[pos_rand]['class'])
+    #
+    #     neg_rand = neg_index[np.random.randint(len(neg_index))]
+    #     train_text.append(train_data.iloc[neg_rand]['text'])
+    #     train_label.append(train_data.iloc[neg_rand]['class'])
+    ## 2. 带权重的交叉熵
+    # criterion = nn.CrossEntropyLoss()
+
+    # pos = 1  / len([x for x in train_label if x == 1])
+    # neg = 1 / len([x for x in train_label if x == 0])
+    # neu = 1 / len([x for x in train_label if x == 2])
+    # weight = torch.tensor([neg,pos,neu],dtype = torch.float)
+    # weight.to(device)
+    # print(weight)
+    # criterion = nn.CrossEntropyLoss(weight = weight)
+
+    ## 3. Focal Loss
+    # criterion = FocalLoss_Ori(num_class=3)
+    train_dataset = sentiment_dataset(train_text,train_label)
     # train_dataset,valid_dataset = random_split(train_dataset,[7000,528],generator=torch.Generator().manual_seed(42))
     train_data_loader = DataLoader(
                     train_dataset,
-                    batch_size = 32,
+                    batch_size = 64,
                     collate_fn = sentiment_collate_fn,
                     shuffle=True
     )
@@ -55,8 +170,7 @@ if __name__ == '__main__':
 
 
     ## train parameters
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(device)
+
 
     model = sentiment_model()
     criterion = nn.CrossEntropyLoss()
@@ -105,7 +219,7 @@ if __name__ == '__main__':
                 tic_train = time.time()
         mean_loss = sum(total_acc) / len(total_acc)
 
-        print('epoch:%d,total_loss:%.5f,accu:%.5f' % (epoch, train_loss * epoch / global_step,mean_loss) )
+        print('epoch:%d,total_loss:%.5f,accu:%.5f' % (epoch, train_loss * epoch / global_step,mean_loss))
         save_dir = os.path.join(ckpt_dir, "model")
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)

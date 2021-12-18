@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import torch
 import os
-from utils import load_vectors
-from preprocess import data_process,read_data_from_csv,ner_dataset,bert_ner_dataset
+from utils import load_vectors,ner_accuary
+from preprocess import data_process,read_data_from_csv,lstm_ner_dataset,bert_ner_dataset
 class sentiment_model(nn.Module):
     def __init__(self,dropout=None):
         super(sentiment_model,self).__init__()
@@ -30,7 +30,7 @@ class BERT_CRF(nn.Module):
     def __init__(self,tag_to_ix):
         super(BERT_CRF,self).__init__()
         self.tag_to_ix = tag_to_ix
-        self.crf = CRF2(self.tag_to_ix)
+        self.crf = CRF(self.tag_to_ix)
         self.bert = AutoModel.from_pretrained("nghuyong/ernie-1.0")
         self.target_size = len(tag_to_ix)
         self.dropout = nn.Dropout(0.2)
@@ -42,7 +42,7 @@ class BERT_CRF(nn.Module):
         outputs = self.dropout(feats.last_hidden_state)
         outputs = self.classifier(outputs)
         # crf
-        loss = self.crf.neg_log_likelihood(outputs[:,1:,:], label[:,1:],text_lengths) # ,
+        loss = self.crf.neg_log_likelihood(outputs[:,1:,:], label[:,1:],text_lengths) # 去除第一个CLS label和输出
         return loss
     def decode(self,inputs_ids,token_type_ids,attention_mask,text_lengths):
         bert_feats = self.bert(inputs_ids,token_type_ids,attention_mask)
@@ -73,7 +73,7 @@ class BiLSTM_CRF(nn.Module):
         paths = []
         for feats,length in zip(batch_feats,text_lengths):
             feats = feats[:length]
-            path = self.crf.decode(feats,tag_to_ix)
+            path = self.crf.decode(feats)
             paths.append(path)
 
         return paths
@@ -174,33 +174,75 @@ class CRF(nn.Module):
             gold_score = self.gold_score(feat[:length],lab[:length])
             loss += forward_score - gold_score
         return loss / feats.size(0)
-    def decode(self,feats):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        viterbi_score = torch.tensor(torch.full((1, self.target_size), -10000.),device = device)
-        viterbi_score[0][self.tag_to_ix[self.START_TAG]] = 0
+    # def decode(self,feats):
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #     viterbi_score = torch.tensor(torch.full((1, self.target_size), -10000.),device = device)
+    #     viterbi_score[0][self.tag_to_ix[self.START_TAG]] = 0
+    #     backpointers = []
+    #     for i,feat in enumerate(feats):
+    #         each_back = []
+    #         each_viterbi = []
+    #         for j in range(self.target_size):
+    #             cur_score = viterbi_score + feat + self.transitions.data[:,j]  ##  算了START_TAG到第一个状态的转移概率
+    #             max_element = torch.max(cur_score,-1)
+    #             each_back.append(max_element.indices)
+    #             each_viterbi.append(max_element.values)
+    #         backpointers.append(each_back)
+    #         viterbi_score = torch.tensor(each_viterbi,device=device)
+    #     viterbi_score += self.transitions.data[:,self.tag_to_ix[self.STOP_TAG]] ##  算了最后一个状态到STOP_TAG的转移概率
+    #
+    #     best_tag_id = torch.max(viterbi_score,0).indices
+    #     best_path = [best_tag_id]
+    #     for bptrs_t in reversed(backpointers):
+    #         best_tag_id = bptrs_t[best_tag_id]
+    #         best_path.append(best_tag_id)
+    #
+    #     start = best_path.pop()
+    #     assert start == self.tag_to_ix[self.START_TAG]  # Sanity check
+    #     best_path.reverse()
+    #     return best_path
+    def decode(self, feats):
         backpointers = []
-        for i,feat in enumerate(feats):
-            each_back = []
-            each_viterbi = []
-            for j in range(self.target_size):
-                cur_score = viterbi_score + feat + self.transitions.data[:,j]  ##  算了START_TAG到第一个状态的转移概率
-                max_element = torch.max(cur_score,-1)
-                each_back.append(max_element.indices)
-                each_viterbi.append(max_element.values)
-            backpointers.append(each_back)
-            viterbi_score = torch.tensor(each_viterbi,device=device)
-        viterbi_score += self.transitions.data[:,self.tag_to_ix[self.STOP_TAG]] ##  算了最后一个状态到STOP_TAG的转移概率
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 初始化viterbi的previous变量
+        init_vvars = torch.tensor(torch.full((1, self.target_size), -10000.),device=device)
+        init_vvars[0][self.tag_to_ix[self.START_TAG]] = 0
+        previous = init_vvars
+        for obs in feats:
+            # 保存当前时间步的回溯指针
+            bptrs_t = []
+            # 保存当前时间步的viterbi变量
+            viterbivars_t = []
 
-        best_tag_id = torch.max(viterbi_score,0).indices
+            for next_tag in range(self.target_size):
+                # 维特比算法记录最优路径时只考虑上一步的分数以及上一步tag转移到当前tag的转移分数(因为加了stop_tag，可以倒推）
+                # 并不取决与当前tag的发射分数
+                next_tag_var = previous + self.transitions[:,next_tag]
+                best_tag_id = argmax(next_tag_var)
+                bptrs_t.append(best_tag_id)
+                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
+            # 更新previous，加上当前tag的发射分数obs
+            previous = (torch.cat(viterbivars_t) + obs).view(1, -1)
+            # 回溯指针记录当前时间步各个tag来源前一步的tag
+            backpointers.append(bptrs_t)
+
+        # Transition to STOP_TAG
+        # 考虑转移到STOP_TAG的转移分数
+        terminal_var = previous + self.transitions[:,self.tag_to_ix[self.STOP_TAG]]
+        best_tag_id = argmax(terminal_var)
+        path_score = terminal_var[0][best_tag_id]
+
+        # 通过回溯指针解码出最优路径
         best_path = [best_tag_id]
+        # best_tag_id作为线头，反向遍历backpointers找到最优路径
         for bptrs_t in reversed(backpointers):
             best_tag_id = bptrs_t[best_tag_id]
             best_path.append(best_tag_id)
-
+        # 去除START_TAG
         start = best_path.pop()
         assert start == self.tag_to_ix[self.START_TAG]  # Sanity check
         best_path.reverse()
-        return best_path
+        return  best_path
 class CRF2(nn.Module):
     def __init__(self,tag_to_ix):
         super(CRF2, self).__init__()
@@ -341,127 +383,80 @@ def log_sum_exp(vec):
 
 
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
+def lstm_ner_collate_fn(batch):
+    inputs_ids,label_ids,text_lengths = zip(*batch)
+    max_len = max([length for length in text_lengths])
+    inputs_ids = [seq + [0]*(max_len-len(seq)) for seq in inputs_ids]
+    label_ids = [seq + [0]*(max_len-len(seq)) for seq in label_ids]
+    return torch.tensor(inputs_ids,dtype = torch.long),torch.tensor(label_ids,dtype=torch.long),torch.tensor(text_lengths,dtype=torch.long)
 
 if __name__ == '__main__':
 
     # test BiLSTM_CRF
-    # fast_text,word2idx = load_vectors("../../ff/cc.zh.300.vec")  # 词向量位置
-    # train_data,test_data = read_data_from_csv()
-    # ## datasets
-    # input_ids, label_ids, tag_to_ix, text_lengths = data_process(train_data['text'], train_data['BIO_anno'],word2idx = word2idx)
-    # vocab_size = len(word2idx)
-    # embedding = torch.tensor(fast_text,dtype=torch.float)
-    # hidden_dim = 100
-    # model = BiLSTM_CRF(vocab_size, tag_to_ix, embedding, hidden_dim)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-    #
-    # train_datasets = ner_dataset(input_ids,label_ids,text_lengths)
-    # train_data_loader = DataLoader(train_datasets, batch_size=32, num_workers=4,collate_fn=ner_collate_fn, shuffle=True)
-    # model.train()
-    # for batch in train_data_loader:
-    #     optimizer.zero_grad()
-    #     X,label,text_lengths = batch
-    #     loss = model.forward(X,label,text_lengths)
-    #     print('loss:',loss)
-    #     ret = model.decode(X,text_lengths,tag_to_ix)
-    #     print(ret[0])
-    #     loss.backward()
-    #     nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
-    #     optimizer.step()
-
-    #test BERT_CRF
-    train_data,test_data = read_data_from_csv()
-    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
-    tag_to_ix = {'B-BANK': 0, 'I-BANK': 1, 'O': 2, 'B-COMMENTS_N': 3, 'I-COMMENTS_N': 4, 'B-COMMENTS_ADJ': 5, 'I-COMMENTS_ADJ': 6, 'B-PRODUCT': 7, 'I-PRODUCT': 8, '<START>': 9, '<STOP>': 10}
-    ## datasets
-    train_datasets = bert_ner_dataset(train_data['text'],train_data['BIO_anno'],tag_to_ix)
-    train_datasets,valid_datasets = torch.utils.data.random_split(train_datasets,[7000,528],generator=torch.Generator().manual_seed(42))
-    train_data_loader = DataLoader(
-                    train_datasets,
-                    batch_size = 32,
-                    collate_fn = bert_collate_fn,
-                    shuffle=True
-    )
-    valid_data_loader = DataLoader(
-                    valid_datasets,
-                    batch_size = 32,
-                    collate_fn = bert_collate_fn,
-                    shuffle=True
-    )
-    ## train parameters
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(device)
+    fast_text,word2idx = load_vectors("../../ff/cc.zh.300.vec")  # fast_text词向量位置
+    train_data,test_data = read_data_from_csv()
+    ## datasets
+    input_ids, label_ids, tag_to_ix, text_lengths = data_process(train_data['text'], train_data['BIO_anno'],word2idx = word2idx)
+    vocab_size = len(word2idx)
+    embedding = torch.tensor(fast_text,dtype=torch.float)
+    hidden_dim = 100
+    model = BiLSTM_CRF(vocab_size, tag_to_ix, embedding, hidden_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
-    model = BERT_CRF(tag_to_ix)
-    criterion = nn.CrossEntropyLoss(ignore_index=-1)
-    criterion = criterion.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 80], gamma=0.4)
-    model = model.to(device)
-    ckpt_dir = './'
-
-    # train
-    epoches = 10
-    global_step = 0
-    for epoch in range(1, epoches + 1):
+    train_datasets = lstm_ner_dataset(input_ids,label_ids,text_lengths)
+    train_datasets, valid_datasets = torch.utils.data.random_split(train_datasets, [5522, 500],
+                                                                   generator=torch.Generator().manual_seed(42))
+    train_data_loader = DataLoader(train_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
+    valid_data_loader = DataLoader(valid_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
+    model.to(device)
+    model.train()
+    epochs= 5
+    step = 0
+    for epoch in range(epochs):
         model.train()
-        train_loss = 0
-        # for step, batch in enumerate(train_data_loader, start=1):
-        #     optimizer.zero_grad()
-        #     input_ids, token_type_ids, attention_mask, labels,text_lengths = batch
-        #     input_ids = input_ids.to(device, dtype=torch.long)
-        #     token_type_ids = token_type_ids.to(device, dtype=torch.long)
-        #     attention_mask = attention_mask.to(device, dtype=torch.long)
-        #     labels = labels.to(device, dtype=torch.long)
-        #     text_lengths = text_lengths.to(device,dtype=torch.long)
-        #     # 喂数据给model
-        #     # pred = model.forward(input_ids,token_type_ids,attention_mask,labels,text_lengths)
-        #     # loss = 0
-        #     # for i in range(pred.size(0)):
-        #     #     loss += criterion(pred[i],labels[i])
-        #
-        #     # crf
-        #     loss = model.forward(input_ids,token_type_ids,attention_mask,labels,text_lengths)
-        #
-        #     # 计算损失函数值
-        #     train_loss += loss
-        #     loss.backward()
-        #     print('loss:',loss)
-        #     optimizer.step()
-        #     scheduler.step()
-        #     global_step += 1
-        # print('epoch:%d,mean_loss:%.5f' % (
-        # epoch, train_loss / len(train_data_loader)))
-        # 评估当前训练的模型
+        total_F1 = []
+        total_loss = []
+        for batch in train_data_loader:
+            optimizer.zero_grad()
+            X,label,text_lengths = batch
+            X = X.to(device)
+            label = label.to(device)
+            text_lengths = text_lengths.to(device)
+            loss = model.forward(X,label,text_lengths)
+            total_loss.append(loss)
+            ret = model.decode(X,text_lengths,tag_to_ix)
+            print('epoch:%d,step:%d,loss:%.5f' % (epoch,step,loss))
+            step += 1
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
+            optimizer.step()
+        print("epoch:%d,mean_loss : %.5f" % (epoch, sum(total_loss) / len(total_loss)))
         model.eval()
-        save_dir = os.path.join(ckpt_dir, "model")
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        with torch.no_grad():
-            torch.cuda.empty_cache()
-            total_acc = []
-            for i, batch in enumerate(valid_data_loader):
-                input_ids, token_type_ids, attention_mask, labels, text_lengths = batch
-                input_ids = input_ids.to(device, dtype=torch.long)
-                token_type_ids = token_type_ids.to(device, dtype=torch.long)
-                attention_mask = attention_mask.to(device, dtype=torch.long)
-                labels = labels.to(device, dtype=torch.long)
-                text_lengths = text_lengths.to(device, dtype=torch.long)
-                # 喂数据给model
-                # pred = model.forward(input_ids, token_type_ids, attention_mask, labels, text_lengths)
-                # pred = torch.argmax(pred,-1)
-                pred = model.decode(input_ids, token_type_ids, attention_mask,text_lengths)
-                tags = []
-                ret= []
-                id_to_tag = list(tag_to_ix.keys())
-                for id in labels[0][1:text_lengths[0]]:
-                    tags.append(id_to_tag[id])
-                for id in pred[0][1:text_lengths[0]]:
-                    ret.append(id_to_tag[id])
-                print('orgin-tag:', tags)
-                print('predict-tag:', ret)
-            torch.save(model.state_dict(), os.path.join(save_dir, 'ner_bert_best_model.pt'))
+        for batch in valid_data_loader:
+            X,labels,text_lengths = batch
+            X = X.to(device)
+            label = label.to(device)
+            text_lengths = text_lengths.to(device)
+            pred = model.decode(X, text_lengths, tag_to_ix)
+            p, r, F1 = ner_accuary(pred, labels, tag_to_ix, text_lengths)
+            total_F1.append(F1)
+            tags = []
+            ret = []
+            id_to_tag = list(tag_to_ix.keys())
+            # 展示每个batch的第一个数据结果
+            for id in labels[0][text_lengths[0]]:
+                tags.append(id_to_tag[id])
+            for id in pred[0][:text_lengths[0]]:
+                ret.append(id_to_tag[id])
+            print('orgin-tag:', tags)
+            print('predict-tag:', ret)
+            print("F1 score:", F1)
+        cur_F1 = sum(total_F1) / len(total_F1)
+        print("valid F1 score:", cur_F1)
+        if cur_F1 > valid_F1:
+            valid_F1 = cur_F1
+
 
 
 

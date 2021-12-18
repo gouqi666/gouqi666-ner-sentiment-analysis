@@ -99,9 +99,9 @@ class bert_ner_dataset(Dataset):
 
     def __len__(self):
         return len(self.input_ids)
-class ner_dataset(Dataset):
+class lstm_ner_dataset(Dataset):
     def __init__(self,data,label=None,text_lengths = None,is_train = True):
-        super(ner_dataset).__init__()
+        super(lstm_ner_dataset).__init__()
         self.input_ids = data
         self.label = label
         self.text_lengths = text_lengths

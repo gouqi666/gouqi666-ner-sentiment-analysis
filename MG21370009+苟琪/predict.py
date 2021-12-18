@@ -2,7 +2,7 @@ import pandas as pd
 from transformers import BertTokenizer, BertModel,AutoTokenizer, AutoModel
 from model import sentiment_model, BiLSTM_CRF,BERT_CRF
 import torch
-from preprocess import read_data_from_csv, sentiment_dataset,ner_dataset,data_process,bert_ner_dataset
+from preprocess import read_data_from_csv, sentiment_dataset,data_process,bert_ner_dataset
 from torch.utils.data import DataLoader
 from sentiment_task import sentiment_collate_fn
 from utils import ner_accuary2,calculate_kappa
@@ -38,7 +38,7 @@ def predict_ner(test_data_loader,tag_to_ix):
 
     model = BERT_CRF(tag_to_ix)
     model = model.to(device)
-    model.load_state_dict(torch.load('./model/ner_bert_crf2_best_model.pt'))
+    model.load_state_dict(torch.load('./model/ner_bert_crf_best_model.pt'))
     BIO = []
     model.eval()
     torch.cuda.empty_cache()
