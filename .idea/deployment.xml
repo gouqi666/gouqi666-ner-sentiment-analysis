@@ -9,17 +9,10 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="student2021@114.212.86.105:22">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="tfgirl">
         <serverdata>
           <mappings>
-            <mapping deploy="/产品评论观点提取baseline" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

@@ -120,7 +120,7 @@ if __name__ == '__main__':
     train_data,test_data = read_data_from_csv()
     train_text = list(train_data['text'])
     train_label = list(train_data['class'])
-    ## 1. 增加低比例样本，随机采样
+    ## 2. 增加低比例样本，随机采样
     # neg_index = []
     # pos_index = []
     # for i in range(len(train_label)):
@@ -140,7 +140,7 @@ if __name__ == '__main__':
     #     neg_rand = neg_index[np.random.randint(len(neg_index))]
     #     train_text.append(train_data.iloc[neg_rand]['text'])
     #     train_label.append(train_data.iloc[neg_rand]['class'])
-    ## 2. 带权重的交叉熵
+    ## 3. 带权重的交叉熵
     # criterion = nn.CrossEntropyLoss()
 
     # pos = 1  / len([x for x in train_label if x == 1])
@@ -151,7 +151,7 @@ if __name__ == '__main__':
     # print(weight)
     # criterion = nn.CrossEntropyLoss(weight = weight)
 
-    ## 3. Focal Loss
+    ## 4. Focal Loss
     # criterion = FocalLoss_Ori(num_class=3)
     train_dataset = sentiment_dataset(train_text,train_label)
     # train_dataset,valid_dataset = random_split(train_dataset,[7000,528],generator=torch.Generator().manual_seed(42))
@@ -173,6 +173,7 @@ if __name__ == '__main__':
 
 
     model = sentiment_model()
+    # 5.  baseline CrossEntropy
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
     optimizer = optim.Adam(model.parameters(), lr=2e-5)

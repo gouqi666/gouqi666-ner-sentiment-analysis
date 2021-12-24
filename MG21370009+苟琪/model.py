@@ -25,7 +25,21 @@ class sentiment_model(nn.Module):
         logits = self.classifier(outputs)
         return logits
 
+class BERT(nn.Module):  ## 直接用BERT + MLP 做NER
+    def __init__(self, tag_to_ix):
+        super(BERT, self).__init__()
+        self.tag_to_ix = tag_to_ix
+        self.bert = AutoModel.from_pretrained("nghuyong/ernie-1.0")
+        self.target_size = len(tag_to_ix)
+        self.dropout = nn.Dropout(0.2)
+        # NER
+        self.classifier = nn.Linear(self.bert.config.hidden_size, self.target_size)
 
+    def forward(self, inputs_ids, token_type_ids, attention_mask):
+        feats = self.bert(inputs_ids, token_type_ids, attention_mask)
+        outputs = self.dropout(feats.last_hidden_state)
+        outputs = self.classifier(outputs)
+        return outputs # 返回logits再送入cross_entropy即可
 class BERT_CRF(nn.Module):
     def __init__(self,tag_to_ix):
         super(BERT_CRF,self).__init__()
@@ -55,6 +69,35 @@ class BERT_CRF(nn.Module):
             paths.append(path)
         return paths
 
+
+class BERT_CRF2(nn.Module):
+    def __init__(self,tag_to_ix):
+        super(BERT_CRF2,self).__init__()
+        self.tag_to_ix = tag_to_ix
+        self.crf = CRF2(self.tag_to_ix)
+        self.bert = AutoModel.from_pretrained("nghuyong/ernie-1.0")
+        self.target_size = len(tag_to_ix)
+        self.dropout = nn.Dropout(0.2)
+        # NER
+        self.classifier = nn.Linear(self.bert.config.hidden_size, self.target_size)
+
+    def forward(self,inputs_ids,token_type_ids,attention_mask,label,text_lengths):
+        feats = self.bert(inputs_ids,token_type_ids,attention_mask)
+        outputs = self.dropout(feats.last_hidden_state)
+        outputs = self.classifier(outputs)
+        # crf
+        loss = self.crf.neg_log_likelihood(outputs[:,1:,:], label[:,1:],text_lengths) # 去除第一个CLS label和输出
+        return loss
+    def decode(self,inputs_ids,token_type_ids,attention_mask,text_lengths):
+        bert_feats = self.bert(inputs_ids,token_type_ids,attention_mask)
+        outputs = self.dropout(bert_feats.last_hidden_state)
+        outputs = self.classifier(outputs)
+        paths = []
+        for feats,length in zip(outputs,text_lengths): ##text_length是不含padding的数据
+            feats = feats[1:length+1] ##去除开头的cls和后面的padding
+            path = self.crf.decode(feats)
+            paths.append(path)
+        return paths
 class BiLSTM_CRF(nn.Module):
     def __init__(self,vocab_size,tag_to_ix,embedding,hidden_dim):
         super(BiLSTM_CRF,self).__init__()
@@ -383,87 +426,72 @@ def log_sum_exp(vec):
 
 
 
-def lstm_ner_collate_fn(batch):
-    inputs_ids,label_ids,text_lengths = zip(*batch)
-    max_len = max([length for length in text_lengths])
-    inputs_ids = [seq + [0]*(max_len-len(seq)) for seq in inputs_ids]
-    label_ids = [seq + [0]*(max_len-len(seq)) for seq in label_ids]
-    return torch.tensor(inputs_ids,dtype = torch.long),torch.tensor(label_ids,dtype=torch.long),torch.tensor(text_lengths,dtype=torch.long)
 
 if __name__ == '__main__':
-
+    pass
     # test BiLSTM_CRF
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    fast_text,word2idx = load_vectors("../../ff/cc.zh.300.vec")  # fast_text词向量位置
-    train_data,test_data = read_data_from_csv()
-    ## datasets
-    input_ids, label_ids, tag_to_ix, text_lengths = data_process(train_data['text'], train_data['BIO_anno'],word2idx = word2idx)
-    vocab_size = len(word2idx)
-    embedding = torch.tensor(fast_text,dtype=torch.float)
-    hidden_dim = 100
-    model = BiLSTM_CRF(vocab_size, tag_to_ix, embedding, hidden_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-
-    train_datasets = lstm_ner_dataset(input_ids,label_ids,text_lengths)
-    train_datasets, valid_datasets = torch.utils.data.random_split(train_datasets, [5522, 500],
-                                                                   generator=torch.Generator().manual_seed(42))
-    train_data_loader = DataLoader(train_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
-    valid_data_loader = DataLoader(valid_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
-    model.to(device)
-    model.train()
-    epochs= 5
-    step = 0
-    for epoch in range(epochs):
-        model.train()
-        total_F1 = []
-        total_loss = []
-        for batch in train_data_loader:
-            optimizer.zero_grad()
-            X,label,text_lengths = batch
-            X = X.to(device)
-            label = label.to(device)
-            text_lengths = text_lengths.to(device)
-            loss = model.forward(X,label,text_lengths)
-            total_loss.append(loss)
-            ret = model.decode(X,text_lengths,tag_to_ix)
-            print('epoch:%d,step:%d,loss:%.5f' % (epoch,step,loss))
-            step += 1
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
-            optimizer.step()
-        print("epoch:%d,mean_loss : %.5f" % (epoch, sum(total_loss) / len(total_loss)))
-        model.eval()
-        for batch in valid_data_loader:
-            X,labels,text_lengths = batch
-            X = X.to(device)
-            label = label.to(device)
-            text_lengths = text_lengths.to(device)
-            pred = model.decode(X, text_lengths, tag_to_ix)
-            p, r, F1 = ner_accuary(pred, labels, tag_to_ix, text_lengths)
-            total_F1.append(F1)
-            tags = []
-            ret = []
-            id_to_tag = list(tag_to_ix.keys())
-            # 展示每个batch的第一个数据结果
-            for id in labels[0][text_lengths[0]]:
-                tags.append(id_to_tag[id])
-            for id in pred[0][:text_lengths[0]]:
-                ret.append(id_to_tag[id])
-            print('orgin-tag:', tags)
-            print('predict-tag:', ret)
-            print("F1 score:", F1)
-        cur_F1 = sum(total_F1) / len(total_F1)
-        print("valid F1 score:", cur_F1)
-        if cur_F1 > valid_F1:
-            valid_F1 = cur_F1
-
-
-
-
-
-
-
-
-
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # fast_text,word2idx = load_vectors("../../ff/cc.zh.300.vec")  # fast_text词向量位置
+    # train_data,test_data = read_data_from_csv()
+    # ## datasets
+    # input_ids, label_ids, tag_to_ix, text_lengths = data_process(train_data['text'], train_data['BIO_anno'],word2idx = word2idx)
+    # vocab_size = len(word2idx)
+    # embedding = torch.tensor(fast_text,dtype=torch.float)
+    # hidden_dim = 100
+    # model = BiLSTM_CRF(vocab_size, tag_to_ix, embedding, hidden_dim)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    #
+    # train_datasets = lstm_ner_dataset(input_ids,label_ids,text_lengths)
+    # train_datasets, valid_datasets = torch.utils.data.random_split(train_datasets, [5522, 500],
+    #                                                                generator=torch.Generator().manual_seed(42))
+    # train_data_loader = DataLoader(train_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
+    # valid_data_loader = DataLoader(valid_datasets, batch_size=32, num_workers=4,collate_fn=lstm_ner_collate_fn, shuffle=True)
+    # model.to(device)
+    # model.train()
+    # epochs= 5
+    # step = 0
+    # for epoch in range(epochs):
+    #     model.train()
+    #     total_F1 = []
+    #     total_loss = []
+    #     for batch in train_data_loader:
+    #         optimizer.zero_grad()
+    #         X,label,text_lengths = batch
+    #         X = X.to(device)
+    #         label = label.to(device)
+    #         text_lengths = text_lengths.to(device)
+    #         loss = model.forward(X,label,text_lengths)
+    #         total_loss.append(loss)
+    #         ret = model.decode(X,text_lengths,tag_to_ix)
+    #         print('epoch:%d,step:%d,loss:%.5f' % (epoch,step,loss))
+    #         step += 1
+    #         loss.backward()
+    #         nn.utils.clip_grad_norm_(model.parameters(), max_norm=20, norm_type=2)
+    #         optimizer.step()
+    #     print("epoch:%d,mean_loss : %.5f" % (epoch, sum(total_loss) / len(total_loss)))
+    #     model.eval()
+    #     for batch in valid_data_loader:
+    #         X,labels,text_lengths = batch
+    #         X = X.to(device)
+    #         label = label.to(device)
+    #         text_lengths = text_lengths.to(device)
+    #         pred = model.decode(X, text_lengths, tag_to_ix)
+    #         p, r, F1 = ner_accuary(pred, labels, tag_to_ix, text_lengths)
+    #         total_F1.append(F1)
+    #         tags = []
+    #         ret = []
+    #         id_to_tag = list(tag_to_ix.keys())
+    #         # 展示每个batch的第一个数据结果
+    #         for id in labels[0][text_lengths[0]]:
+    #             tags.append(id_to_tag[id])
+    #         for id in pred[0][:text_lengths[0]]:
+    #             ret.append(id_to_tag[id])
+    #         print('orgin-tag:', tags)
+    #         print('predict-tag:', ret)
+    #         print("F1 score:", F1)
+    #     cur_F1 = sum(total_F1) / len(total_F1)
+    #     print("valid F1 score:", cur_F1)
+    #     if cur_F1 > valid_F1:
+    #         valid_F1 = cur_F1
 
 
